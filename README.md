@@ -6,13 +6,47 @@ Rust rewrite of [Durandal](https://github.com/Blumenwagen/durandal): a Linux ter
 
 Durandal RS is kept in its own repository so the original Go implementation can stay stable while the Rust port grows toward feature parity.
 
-## Updated project info
+## Dashboard
 
-- **Status:** ready for an initial public `0.1.0` repository push.
-- **Scope:** Linux-focused TUI monitor, Sentinel health scoring, JSON snapshots, Prometheus/OpenMetrics output, and health-check exit codes.
-- **Parity target:** visually match the Go Durandal dashboard while moving toward a stronger Rust core.
-- **Current caveat:** this is not a full replacement for Go Durandal yet. Interactive Docker start/stop/restart execution is represented by gated Rust action-planning helpers, but the live TUI currently exposes focus/sort/dim navigation rather than container mutation hotkeys.
-- **Verification used for this push:** `cargo fmt -- --check`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build --release`, and live CLI smoke tests.
+![Durandal RS dashboard with demo telemetry](docs/dashboard.png)
+
+The dashboard keeps Durandal's magenta, lime, and cyan identity with quieter borders,
+clear panel focus, and more space for process rows. At 100 columns and 24 rows or
+larger, resources sit beside the process and Docker tables. Smaller terminals show
+a compact resource summary and one focused table; `Tab` switches between processes
+and containers. Below 50 × 12, the app asks for more space while keeping quit available.
+
+![Compact dashboard at 64 columns](docs/compact.png)
+
+These images render deterministic demo values through the actual Ratatui widgets;
+they are not measurements from a running Linux machine. The renderer is reproducible:
+
+```sh
+cargo run --example dashboard
+cargo run --example dashboard -- --width 64 --height 18
+cargo run --example dashboard -- --mode inspector
+```
+
+The example also supports `docker`, `search`, `help`, `alerts`, `confirm`, and
+`offline` modes, and `--cells` exports the rendered cell colors and text as JSON.
+
+## Current scope
+
+Linux TUI monitor, Sentinel health signals, JSON snapshots, Prometheus/OpenMetrics
+output, and health-check exit codes. The Go implementation remains separate.
+
+- Collection runs on a worker so slow telemetry or Docker queries do not block navigation.
+- Process CPU and aggregate non-loopback network rates use real interval counters
+  in the TUI. The first sample is a baseline, shown as unavailable rather than zero.
+  A newly observed process needs its own baseline; its CPU starts at zero.
+- Process selection follows the PID and container selection follows the container ID
+  across refreshes, with stable PID ordering for equal sort values.
+- Pause freezes the displayed snapshot. Destructive actions require resuming first,
+  then a confirmation dialog with a captured target. `K` sends SIGTERM, not SIGKILL.
+- The inspector retains the full command line and can scroll. GPU discovery is shown
+  without inventing utilization or temperature readings; GPU sensors remain unimplemented.
+- Interval sampling applies to the TUI. One-shot JSON/Prometheus output retains its
+  schema and does not gain interval measurements.
 
 ## What works now
 
@@ -32,7 +66,7 @@ Durandal RS is kept in its own repository so the original Go implementation can 
 Requirements:
 
 - Linux
-- Rust stable with Edition 2024 support (`rustc 1.85+`)
+- Rust 1.88 or later (Edition 2024 and let-chain support)
 - Docker CLI is optional; Durandal RS still runs when Docker is missing or unavailable.
 
 ```bash
@@ -127,12 +161,30 @@ Use `--top N` to cap process-cardinality surfaces where applicable.
 
 ## TUI controls
 
-- `q` or `Esc`: quit
-- `c`: toggle Docker focus styling
-- `s` or `Tab`: toggle process sort mode
-- `d`: toggle dimmed visual mode
+| Key | Action |
+| --- | --- |
+| `Tab`, `Shift+Tab`, `c` | Switch between process and Docker panels |
+| `↑`/`k`, `↓`/`j` | Move selection |
+| `PageUp`, `PageDown` | Move one visible table page; scroll an open inspector/help dialog |
+| `Home`, `End` | Select the first/last row |
+| `s` | Switch CPU/memory sorting in the process panel |
+| `/` | Edit a process filter by name, command, or PID |
+| `Enter` / `Esc` during search | Apply / cancel edits (cancel restores the previous filter) |
+| `Enter` | Open/close the selected process inspector |
+| `Esc` | Close inspector, clear an applied search, or return to processes |
+| `a` | Inspect Sentinel health signals; `↑`/`↓` scroll, `Esc` closes |
+| `Space` | Pause/resume displayed telemetry |
+| `?`, `F1` | Show keyboard help; `↑`/`↓` and page keys scroll |
+| `K` | Request SIGTERM for the selected process; confirm with `Y`, cancel with `N`/`Esc` |
+| `x` / `r` | Start/stop or restart a selected container; confirmation required |
+| `d` | Toggle dimmed colors |
+| `q` | Quit; closes help or cancels a confirmation first |
+| `Ctrl+C` | Quit from any input mode |
 
-The TUI is intentionally conservative about mutating the host. Docker inventory is collected from the local Docker CLI, but live container start/stop/restart hotkeys are still a parity gap for a later milestone.
+Docker inventory collection is read-only (`docker ps -a`). Docker controls are
+available by default and honor `Config` when embedding the TUI; configuration-file
+discovery is still a roadmap item. Actions never run merely by opening a dialog.
+Terminal raw mode and the alternate screen are restored on normal exit and errors.
 
 ## Development / quality gates
 
@@ -150,16 +202,18 @@ The CI workflow runs the same formatting, lint, and test gates on GitHub.
 - `src/metrics.rs`: host, resource, process, Docker, and GPU snapshot collection
 - `src/ops.rs`: Sentinel score/status/alert evaluation
 - `src/agent.rs`: JSON and Prometheus serialization
-- `src/tui.rs`: Ratatui dashboard rendering and key handling
+- `src/tui.rs`: TUI interaction state and background collection
+- `src/tui/view.rs`: adaptive Ratatui widgets and dialogs
+- `src/metrics/live.rs`: interval CPU/network sampling
+- `examples/dashboard.rs`: deterministic native-widget previews
 - `src/docker.rs`: Docker collection and gated action planning
 - `tests/`: CLI, Sentinel, parity, and next-phase behavior tests
 
 ## Roadmap
 
-- Wire guarded Docker start/stop/restart interactions into the live TUI.
 - Add configuration-file discovery and documentation once config loading is user-facing.
 - Expand parity tests against snapshots from Go Durandal.
-- Add screenshots or terminal recordings once the Rust UI stabilizes visually.
+- Add sampled CPU history and measured GPU sensor support.
 - Package release artifacts after the first repository push and CI pass.
 
 ## License

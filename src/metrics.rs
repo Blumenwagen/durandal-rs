@@ -1,4 +1,6 @@
 use anyhow::Context;
+mod live;
+pub use live::{LiveSample, LiveSampler};
 use std::{
     cmp::Ordering, fs, os::unix::fs::MetadataExt, path::Path, process::Command, time::Duration,
 };
@@ -386,11 +388,6 @@ fn read_process(pid: i32, page_size: u64, total_ram: u64) -> Option<ProcessInfo>
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| name.clone());
-    let command = if command.len() > 40 {
-        format!("{}...", &command[..37])
-    } else {
-        command
-    };
     let user = fs::metadata(format!("/proc/{pid}"))
         .ok()
         .map(|m| m.uid().to_string())
