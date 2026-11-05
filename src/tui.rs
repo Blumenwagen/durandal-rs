@@ -1,39 +1,21 @@
-use crate::{agent, config::Config, docker, metrics, ops};
+mod view;
+pub use view::draw as draw_dashboard;
+
+use crate::{config::Config, docker, metrics, ops};
 use anyhow::Context;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
+    collections::VecDeque,
     io,
     process::Command,
+    sync::mpsc,
     time::{Duration, Instant},
 };
-
-const DEFAULT_WIDTH: usize = 120;
-const DEFAULT_HEIGHT: usize = 36;
-
-const NEON_LIME: Color = Color::Rgb(191, 255, 0);
-const HOT_PINK: Color = Color::Rgb(255, 0, 127);
-const CYAN: Color = Color::Rgb(0, 240, 255);
-const DEEP_BLACK: Color = Color::Rgb(10, 10, 10);
-const DARK_NAVY: Color = Color::Rgb(18, 18, 31);
-const MUTED_GREY: Color = Color::Rgb(138, 138, 158);
-const DIM_GREY: Color = Color::Rgb(74, 74, 90);
-const OFF_WHITE: Color = Color::Rgb(216, 216, 232);
-const AMBER: Color = Color::Rgb(255, 184, 0);
-const RED: Color = Color::Rgb(255, 34, 68);
-const DIMMED_LIME: Color = Color::Rgb(111, 143, 0);
-const DIMMED_PINK: Color = Color::Rgb(143, 0, 63);
-const DIMMED_CYAN: Color = Color::Rgb(0, 127, 143);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
@@ -49,32 +31,60 @@ pub struct TuiState {
     pub filtering: bool,
     pub filter: String,
     pub inspector_open: bool,
+    pub inspector_scroll: u16,
     pub docker_confirm: Option<DockerConfirm>,
     pub process_kill_confirm: bool,
     pub action_message: Option<ActionMessage>,
+    pub paused: bool,
+    pub help_open: bool,
+    pub alerts_open: bool,
+    pub alerts_scroll: u16,
+    pub last_updated: Option<Instant>,
+    pub refresh_error: Option<String>,
+    pub process_cpu_available: bool,
+    pub network_rates_available: bool,
+    pub help_scroll: u16,
+    pub process_page_size: usize,
+    pub docker_page_size: usize,
+    pub filter_before_edit: String,
+    pub pending_process: Option<ProcessTarget>,
+    pub pending_container: Option<ContainerTarget>,
+    pub history: VecDeque<TelemetryPoint>,
 }
 
+/// One collected sample, in basis points and bytes/s; never populated by redraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryPoint {
+    pub cpu_basis_points: u16,
+    pub network: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessTarget {
+    pub pid: i32,
+    pub name: String,
+    pub command: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerTarget {
+    pub id: String,
+    pub name: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerConfirm {
     Start,
     Stop,
     Restart,
 }
-
 impl DockerConfirm {
-    fn as_action(self) -> docker::DockerAction {
+    fn as_str(self) -> &'static str {
         match self {
-            Self::Start => docker::DockerAction::Start,
-            Self::Stop => docker::DockerAction::Stop,
-            Self::Restart => docker::DockerAction::Restart,
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
         }
     }
-
-    fn as_str(self) -> &'static str {
-        self.as_action().as_str()
-    }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionMessage {
     pub text: String,
@@ -96,13 +106,28 @@ impl Default for TuiState {
             filtering: false,
             filter: String::new(),
             inspector_open: false,
+            inspector_scroll: 0,
             docker_confirm: None,
             process_kill_confirm: false,
             action_message: None,
+            paused: false,
+            help_open: false,
+            alerts_open: false,
+            alerts_scroll: 0,
+            last_updated: None,
+            refresh_error: None,
+            process_cpu_available: false,
+            network_rates_available: false,
+            help_scroll: 0,
+            process_page_size: 1,
+            docker_page_size: 1,
+            filter_before_edit: String::new(),
+            pending_process: None,
+            pending_container: None,
+            history: VecDeque::new(),
         }
     }
 }
-
 impl TuiState {
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -111,799 +136,444 @@ impl TuiState {
             ..Self::default()
         }
     }
-
-    pub fn toggle_docker_focus(&mut self) {
-        self.docker_focused = !self.docker_focused;
+    pub fn record_sample(&mut self, snapshot: &metrics::Snapshot) {
+        if self.paused {
+            return;
+        }
+        let cpu = if snapshot.cpu.percent.is_finite() {
+            snapshot.cpu.percent.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        self.history.push_back(TelemetryPoint {
+            cpu_basis_points: (cpu * 100.0).round() as u16,
+            network: self.network_rates_available.then_some((
+                snapshot.network.recv_bytes_per_sec,
+                snapshot.network.sent_bytes_per_sec,
+            )),
+        });
+        while self.history.len() > 120 {
+            self.history.pop_front();
+        }
     }
 
+    pub fn toggle_docker_focus(&mut self) {
+        if self.docker_panel_visible {
+            self.docker_focused = !self.docker_focused;
+            self.inspector_open = false;
+        }
+    }
     pub fn toggle_sort(&mut self) {
         self.sort_by_cpu = !self.sort_by_cpu;
         self.process_cursor = 0;
         self.process_offset = 0;
     }
-
     pub fn toggle_dimmed(&mut self) {
         self.dimmed = !self.dimmed;
     }
+    fn confirming(&self) -> bool {
+        self.process_kill_confirm || self.docker_confirm.is_some()
+    }
+    fn message(&mut self, text: impl Into<String>, ok: bool) {
+        self.action_message = Some(ActionMessage {
+            text: text.into(),
+            ok,
+        });
+    }
+    fn cancel_confirmation(&mut self) {
+        self.process_kill_confirm = false;
+        self.docker_confirm = None;
+        self.pending_process = None;
+        self.pending_container = None;
+    }
 }
-
+struct TerminalSession;
+impl TerminalSession {
+    fn enter() -> anyhow::Result<Self> {
+        enable_raw_mode().context("enable raw mode")?;
+        let session = Self;
+        execute!(io::stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+        Ok(session)
+    }
+}
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show).ok();
+    }
+}
 pub fn run_tui() -> anyhow::Result<()> {
     run_tui_with_config(Config::default())
 }
-
 pub fn run_tui_with_config(config: Config) -> anyhow::Result<()> {
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, TuiState::from_config(&config));
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    terminal.show_cursor().ok();
-    result
+    let _session = TerminalSession::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    run_loop(&mut terminal, TuiState::from_config(&config))
 }
-
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut state: TuiState,
 ) -> anyhow::Result<()> {
-    let mut snapshot = metrics::collect_snapshot(50).unwrap_or_default();
-    let mut last_tick = Instant::now();
-    loop {
-        let report = ops::evaluate_snapshot(&snapshot);
-        terminal.draw(|frame| draw(frame, &snapshot, &report, &state))?;
-        if event::poll(Duration::from_millis(180))?
-            && let Event::Key(key) = event::read()?
-        {
-            if handle_key(key, &mut state, &snapshot)? {
+    // A single worker keeps slow telemetry/Docker queries off the input/render thread.
+    let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut sampler = metrics::LiveSampler::new();
+        while request_rx.recv().is_ok() {
+            if result_tx
+                .send(sampler.collect().map_err(|e| e.to_string()))
+                .is_err()
+            {
                 break;
             }
         }
-        if last_tick.elapsed() > Duration::from_secs(1) {
-            snapshot = metrics::collect_snapshot(50).unwrap_or_default();
-            last_tick = Instant::now();
+    });
+    let mut snapshot = metrics::Snapshot::default();
+    let mut in_flight = false;
+    let mut last_request = Instant::now() - Duration::from_secs(1);
+    loop {
+        if !state.paused && !state.confirming() {
+            if let Ok(result) = result_rx.try_recv() {
+                in_flight = false;
+                match result {
+                    Ok(next) => {
+                        reconcile_selection(&mut state, &snapshot, &next.snapshot);
+                        state.process_cpu_available = next.process_cpu_available;
+                        state.network_rates_available = next.network_rates_available;
+                        state.record_sample(&next.snapshot);
+                        snapshot = next.snapshot;
+                        state.last_updated = Some(next.collected_at);
+                        state.refresh_error = None;
+                    }
+                    Err(error) => state.refresh_error = Some(error),
+                }
+            }
+            if !in_flight && last_request.elapsed() >= Duration::from_secs(1) {
+                request_tx.try_send(()).ok();
+                in_flight = true;
+                last_request = Instant::now();
+            }
+        }
+        let report = ops::evaluate_snapshot(&snapshot);
+        terminal.draw(|frame| draw_dashboard(frame, &snapshot, &report, &mut state))?;
+        if event::poll(Duration::from_millis(80))?
+            && let Event::Key(key) = event::read()?
+            && handle_key(key, &mut state, &snapshot)?
+        {
+            break;
         }
     }
     Ok(())
 }
-
 fn handle_key(
     key: KeyEvent,
     state: &mut TuiState,
     snapshot: &metrics::Snapshot,
 ) -> anyhow::Result<bool> {
+    if key.kind == KeyEventKind::Release {
+        return Ok(false);
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
     if state.filtering {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => state.filtering = false,
+            KeyCode::Esc => {
+                state.filter = state.filter_before_edit.clone();
+                state.filtering = false;
+            }
+            KeyCode::Enter => state.filtering = false,
             KeyCode::Backspace => {
                 state.filter.pop();
-                state.process_cursor = 0;
-                state.process_offset = 0;
             }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 state.filter.push(ch);
-                state.process_cursor = 0;
-                state.process_offset = 0;
+            }
+            _ => {}
+        }
+        state.process_cursor = 0;
+        state.process_offset = 0;
+        return Ok(false);
+    }
+    if state.confirming() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                if state.process_kill_confirm {
+                    confirm_process_kill(state, snapshot);
+                } else {
+                    confirm_docker_action(state, snapshot);
+                }
+            }
+            KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => state.cancel_confirmation(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if state.alerts_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('a' | 'q') => state.alerts_open = false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.alerts_scroll = state.alerts_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.alerts_scroll = state.alerts_scroll.saturating_sub(1)
             }
             _ => {}
         }
         return Ok(false);
     }
-
-    if state.process_kill_confirm {
+    if state.help_open {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => confirm_process_kill(state, snapshot),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
-                state.process_kill_confirm = false;
+            KeyCode::Esc | KeyCode::Char('?' | 'q') | KeyCode::F(1) => state.help_open = false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.help_scroll = state.help_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.help_scroll = state.help_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(5),
+            KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(5),
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if state.inspector_open {
+        match key.code {
+            KeyCode::PageDown => {
+                state.inspector_scroll = state.inspector_scroll.saturating_add(5);
+                return Ok(false);
+            }
+            KeyCode::PageUp => {
+                state.inspector_scroll = state.inspector_scroll.saturating_sub(5);
+                return Ok(false);
             }
             _ => {}
         }
-        return Ok(false);
     }
-
-    if state.docker_confirm.is_some() {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => confirm_docker_action(state, snapshot)?,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => state.docker_confirm = None,
-            KeyCode::Char('q') => return Ok(true),
-            _ => {}
-        }
-        return Ok(false);
-    }
-
     match key.code {
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Esc => {
             if state.inspector_open {
                 state.inspector_open = false;
+            } else if !state.filter.is_empty() {
+                state.filter.clear();
+                state.process_cursor = 0;
+                state.process_offset = 0;
             } else {
                 state.docker_focused = false;
+                state.action_message = None;
             }
         }
-        KeyCode::Char('c') => state.toggle_docker_focus(),
-        KeyCode::Char('s') | KeyCode::Tab if !state.docker_focused => state.toggle_sort(),
+        KeyCode::Char('?') | KeyCode::F(1) => {
+            state.help_open = true;
+            state.help_scroll = 0;
+        }
+        KeyCode::Char('c') | KeyCode::Tab | KeyCode::BackTab => state.toggle_docker_focus(),
+        KeyCode::Char('a') => {
+            state.alerts_open = true;
+            state.alerts_scroll = 0;
+        }
+        KeyCode::Char('s') if !state.docker_focused => state.toggle_sort(),
         KeyCode::Char('d') => state.toggle_dimmed(),
+        KeyCode::Char(' ') => state.paused = !state.paused,
         KeyCode::Char('/') if !state.docker_focused => {
+            state.filter_before_edit = state.filter.clone();
             state.filtering = true;
-            state.filter.clear();
-            state.process_cursor = 0;
-            state.process_offset = 0;
+            state.inspector_open = false;
+            state.action_message = None;
         }
         KeyCode::Enter if !state.docker_focused => {
             state.inspector_open = !state.inspector_open;
+            state.inspector_scroll = 0;
         }
         KeyCode::Char('K') if !state.docker_focused => {
-            if selected_process(snapshot, state).is_some() {
+            if state.paused {
+                state.message("Resume updates before sending a signal", false);
+            } else if let Some(proc) = selected_process(snapshot, state) {
+                state.pending_process = Some(ProcessTarget {
+                    pid: proc.pid,
+                    name: proc.name.clone(),
+                    command: proc.command.clone(),
+                });
                 state.process_kill_confirm = true;
                 state.action_message = None;
             }
         }
-        KeyCode::Char('x') if state.docker_focused => request_docker_toggle(state, snapshot),
-        KeyCode::Char('r') if state.docker_focused => request_docker_restart(state, snapshot),
+        KeyCode::Char('x') if state.docker_focused => request_docker_action(state, snapshot, false),
+        KeyCode::Char('r') if state.docker_focused => request_docker_action(state, snapshot, true),
         KeyCode::Down | KeyCode::Char('j') => move_cursor(state, snapshot, 1),
         KeyCode::Up | KeyCode::Char('k') => move_cursor(state, snapshot, -1),
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let page = if state.docker_focused {
+                state.docker_page_size
+            } else {
+                state.process_page_size
+            } as isize;
+            move_cursor(
+                state,
+                snapshot,
+                if key.code == KeyCode::PageUp {
+                    -page
+                } else {
+                    page
+                },
+            );
+        }
+        KeyCode::Home => move_cursor(state, snapshot, -isize::MAX),
+        KeyCode::End => move_cursor(state, snapshot, isize::MAX),
         _ => {}
     }
-
     Ok(false)
 }
-
 fn move_cursor(state: &mut TuiState, snapshot: &metrics::Snapshot, delta: isize) {
-    if state.docker_focused {
-        let len = snapshot.docker.containers.len();
-        state.docker_cursor = moved_index(state.docker_cursor, len, delta);
+    state.inspector_scroll = 0;
+    let (cursor, len) = if state.docker_focused {
+        (&mut state.docker_cursor, snapshot.docker.containers.len())
     } else {
         let len = filtered_sorted_processes(snapshot, state).len();
-        state.process_cursor = moved_index(state.process_cursor, len, delta);
-    }
-}
-
-fn moved_index(current: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    current
+        (&mut state.process_cursor, len)
+    };
+    *cursor = cursor
         .saturating_add_signed(delta)
-        .min(len.saturating_sub(1))
+        .min(len.saturating_sub(1));
 }
-
-fn request_docker_toggle(state: &mut TuiState, snapshot: &metrics::Snapshot) {
-    if !state.docker_controls_enabled || !snapshot.docker.available {
+fn reconcile_selection(
+    state: &mut TuiState,
+    before: &metrics::Snapshot,
+    after: &metrics::Snapshot,
+) {
+    let pid = selected_process(before, state).map(|p| p.pid);
+    let id = selected_container(before, state).map(|c| c.id.as_str());
+    let processes = filtered_sorted_processes(after, state);
+    state.process_cursor = processes
+        .iter()
+        .position(|p| Some(p.pid) == pid)
+        .unwrap_or(state.process_cursor.min(processes.len().saturating_sub(1)));
+    state.docker_cursor = after
+        .docker
+        .containers
+        .iter()
+        .position(|c| Some(c.id.as_str()) == id)
+        .unwrap_or(
+            state
+                .docker_cursor
+                .min(after.docker.containers.len().saturating_sub(1)),
+        );
+}
+fn request_docker_action(state: &mut TuiState, snapshot: &metrics::Snapshot, restart: bool) {
+    if state.paused {
+        state.message("Resume updates before changing a container", false);
+        return;
+    }
+    if !state.docker_controls_enabled {
+        state.message("Docker controls are read-only", false);
+        return;
+    }
+    if !snapshot.docker.available {
+        state.message("Docker is unavailable", false);
         return;
     }
     let Some(container) = selected_container(snapshot, state) else {
         return;
     };
-    state.docker_confirm = Some(if container.running {
+    if restart && !container.running {
+        state.message("Only running containers can be restarted", false);
+        return;
+    }
+    state.pending_container = Some(ContainerTarget {
+        id: container.id.clone(),
+        name: container.name.clone(),
+    });
+    state.docker_confirm = Some(if restart {
+        DockerConfirm::Restart
+    } else if container.running {
         DockerConfirm::Stop
     } else {
         DockerConfirm::Start
     });
     state.action_message = None;
 }
-
-fn request_docker_restart(state: &mut TuiState, snapshot: &metrics::Snapshot) {
-    if !state.docker_controls_enabled || !snapshot.docker.available {
-        return;
-    }
-    let Some(container) = selected_container(snapshot, state) else {
-        return;
-    };
-    if container.running {
-        state.docker_confirm = Some(DockerConfirm::Restart);
-        state.action_message = None;
-    }
-}
-
-fn confirm_docker_action(state: &mut TuiState, snapshot: &metrics::Snapshot) -> anyhow::Result<()> {
-    let Some(confirm) = state.docker_confirm else {
-        return Ok(());
-    };
-    let Some(container) = selected_container(snapshot, state) else {
-        state.docker_confirm = None;
-        return Ok(());
-    };
-    match docker::docker_action(confirm.as_str(), &container.id) {
-        Ok(_) => {
-            state.action_message = Some(ActionMessage {
-                text: format!("OK {} {}", confirm.as_str().to_uppercase(), container.name),
-                ok: true,
-            });
-        }
-        Err(err) => {
-            state.action_message = Some(ActionMessage {
-                text: format!(
-                    "x {} {}: {err}",
-                    confirm.as_str().to_uppercase(),
-                    container.name
+fn confirm_docker_action(state: &mut TuiState, snapshot: &metrics::Snapshot) {
+    if let (Some(action), Some(target)) = (state.docker_confirm, state.pending_container.clone()) {
+        if snapshot.docker.containers.iter().any(|c| c.id == target.id)
+            && state.docker_controls_enabled
+        {
+            match docker::docker_action(action.as_str(), &target.id) {
+                Ok(_) => state.message(format!("{} {}: done", action.as_str(), target.name), true),
+                Err(error) => state.message(
+                    format!("{} {}: {error}", action.as_str(), target.name),
+                    false,
                 ),
-                ok: false,
-            });
+            }
+        } else {
+            state.message("Container is no longer available; action canceled", false);
         }
     }
-    state.docker_confirm = None;
-    Ok(())
+    state.cancel_confirmation();
 }
-
 fn confirm_process_kill(state: &mut TuiState, snapshot: &metrics::Snapshot) {
-    let Some(proc) = selected_process(snapshot, state) else {
-        state.process_kill_confirm = false;
-        return;
-    };
-    let result = Command::new("kill").arg(proc.pid.to_string()).output();
-    state.action_message = Some(match result {
-        Ok(out) if out.status.success() => ActionMessage {
-            text: format!("OK KILL {} ({})", proc.pid, proc.name),
-            ok: true,
-        },
-        Ok(out) => ActionMessage {
-            text: format!(
-                "x KILL {} ({}): {}",
-                proc.pid,
-                proc.name,
-                short_command_error(&out.stderr, &out.stdout)
-            ),
-            ok: false,
-        },
-        Err(err) => ActionMessage {
-            text: format!("x KILL {} ({}): {err}", proc.pid, proc.name),
-            ok: false,
-        },
-    });
-    state.process_kill_confirm = false;
+    if let Some(target) = state.pending_process.clone() {
+        if snapshot
+            .top_processes
+            .iter()
+            .any(|p| p.pid == target.pid && p.command == target.command)
+        {
+            match Command::new("kill")
+                .arg("-TERM")
+                .arg(target.pid.to_string())
+                .output()
+            {
+                Ok(out) if out.status.success() => state.message(
+                    format!("SIGTERM sent to {} ({})", target.name, target.pid),
+                    true,
+                ),
+                Ok(out) => state.message(String::from_utf8_lossy(&out.stderr).trim(), false),
+                Err(error) => state.message(error.to_string(), false),
+            }
+        } else {
+            state.message("Process is no longer available; signal canceled", false);
+        }
+    }
+    state.cancel_confirmation();
 }
-
-fn short_command_error(stderr: &[u8], stdout: &[u8]) -> String {
-    let msg = if stderr.is_empty() {
-        String::from_utf8_lossy(stdout)
-    } else {
-        String::from_utf8_lossy(stderr)
-    };
-    msg.lines()
-        .next()
-        .unwrap_or("command failed")
-        .trim()
-        .to_string()
-}
-
+/// Render the real dashboard widgets without collecting host data.
 pub fn render_dashboard_text(
     snapshot: &metrics::Snapshot,
     report: &ops::Report,
     state: &TuiState,
 ) -> String {
-    render_dashboard_text_width(snapshot, report, state, DEFAULT_WIDTH)
+    render_dashboard_text_size(snapshot, report, state, 120, 36)
 }
-
-fn render_dashboard_text_width(
+pub fn render_dashboard_text_size(
     snapshot: &metrics::Snapshot,
     report: &ops::Report,
     state: &TuiState,
-    width: usize,
+    width: u16,
+    height: u16,
 ) -> String {
-    render_dashboard_text_size(snapshot, report, state, width, DEFAULT_HEIGHT)
-}
-
-fn render_dashboard_text_size(
-    snapshot: &metrics::Snapshot,
-    report: &ops::Report,
-    state: &TuiState,
-    width: usize,
-    height: usize,
-) -> String {
-    let width = width.max(80);
-    let height = height.max(15);
-    let usable_h = height.saturating_sub(2).max(13);
-
-    let mut left_w = width * 35 / 100;
-    if left_w < 30 {
-        left_w = 30;
-    }
-    let mut right_w = width.saturating_sub(left_w);
-    if right_w < 30 {
-        right_w = 30;
-        left_w = width.saturating_sub(right_w);
-    }
-
-    let gpu_h = if snapshot.gpus.is_empty() {
-        0
-    } else {
-        usable_h * 15 / 100
-    };
-    let sentinel_h = (usable_h * 16 / 100).max(5);
-    let cpu_h = usable_h * 22 / 100;
-    let mem_h = usable_h * 22 / 100;
-    let net_h = usable_h * 17 / 100;
-    let disk_h = usable_h.saturating_sub(sentinel_h + cpu_h + gpu_h + mem_h + net_h);
-
-    let mut docker_h = (usable_h * 28 / 100).max(8);
-    if usable_h.saturating_sub(docker_h) < 8 {
-        docker_h = usable_h.saturating_sub(8);
-    }
-    let proc_h = usable_h.saturating_sub(docker_h);
-
-    let left_col = if state.inspector_open {
-        render_inspector(snapshot, state, left_w, usable_h)
-    } else {
-        let mut left_panels = Vec::new();
-        left_panels.push(render_sentinel(report, left_w, sentinel_h));
-        left_panels.push(render_cpu(snapshot, left_w, cpu_h));
-        if !snapshot.gpus.is_empty() {
-            left_panels.push(render_gpu(snapshot, left_w, gpu_h));
-        }
-        left_panels.push(render_memory(snapshot, left_w, mem_h));
-        left_panels.push(render_network(snapshot, left_w, net_h));
-        left_panels.push(render_storage(snapshot, left_w, disk_h));
-        left_panels.join("\n")
-    };
-
-    let right_panels = [
-        render_processes(snapshot, state, right_w, proc_h),
-        render_docker_text(snapshot, state, right_w, docker_h),
-    ];
-
-    let body = join_horizontal(&left_col, &right_panels.join("\n"), left_w, right_w);
-
-    [render_header(snapshot, width), body, help_bar(width)].join("\n")
-}
-
-fn render_header(snapshot: &metrics::Snapshot, width: usize) -> String {
-    let app = " █ DURANDAL ";
-    let tagline = " SYSTEMS MONITOR";
-    let user = if snapshot.host.user.is_empty() {
-        "system"
-    } else {
-        &snapshot.host.user
-    };
-    let mut right = user.to_string();
-    if !snapshot.host.hostname.is_empty() {
-        right.push('@');
-        right.push_str(&snapshot.host.hostname);
-    }
-    if !snapshot.host.uptime.is_empty() {
-        right.push_str("  //  ");
-        right.push_str(&snapshot.host.uptime);
-    }
-    let left = format!("{app}{tagline}");
-    let fill = width.saturating_sub(plain_width(&left) + plain_width(&right) + 1);
-    format!("{}{}{} ", left, " ".repeat(fill), right)
-}
-
-fn render_sentinel(report: &ops::Report, width: usize, height: usize) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{:03} /100  {}  OPS READINESS",
-        report.score,
-        report.status.as_str()
-    ));
-    lines.push(thin_rule(width.saturating_sub(2)));
-    let max_alerts = height.saturating_sub(4).max(1);
-    if report.alerts.is_empty() {
-        lines.push("OK → Awaiting telemetry".into());
-    } else {
-        for (i, alert) in report.alerts.iter().enumerate() {
-            if i >= max_alerts {
-                lines.push(format!("+{} MORE SIGNALS", report.alerts.len() - i));
-                break;
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("in-memory terminal");
+    let mut state = state.clone();
+    terminal
+        .draw(|frame| draw_dashboard(frame, snapshot, report, &mut state))
+        .expect("in-memory draw");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            let mut line = String::new();
+            let mut x = 0;
+            while x < width {
+                let symbol = buffer[(x, y)].symbol();
+                line.push_str(symbol);
+                x += (ratatui::text::Span::raw(symbol).width().max(1) as u16).min(width - x);
             }
-            lines.push(format!("{} → {}", alert.label, alert.message));
-        }
-    }
-    mag_panel("LAPIS SENTINEL", &lines.join("\n"), width, height)
-}
-
-fn render_cpu(snapshot: &metrics::Snapshot, width: usize, height: usize) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{:.1}%  {} THREADS",
-        snapshot.cpu.percent, snapshot.cpu.threads
-    ));
-    let body_h = height.saturating_sub(2).max(1);
-    let core_rows = if snapshot.cpu.threads > 0 {
-        ((snapshot.cpu.threads + 1) / 2).min(body_h / 3).max(1)
-    } else {
-        1
-    };
-    let spark_h = body_h.saturating_sub(1 + core_rows).max(1);
-    for _ in 0..spark_h {
-        lines.push(sparkline(snapshot.cpu.percent, width.saturating_sub(2)));
-    }
-    for i in 0..core_rows {
-        let pct = (snapshot.cpu.percent + (i as f64 * 7.0)).min(100.0);
-        lines.push(format!("C{:<2} {}", i, bar(pct, width.saturating_sub(9))));
-    }
-    mag_panel("CPU", &lines.join("\n"), width, height)
-}
-
-fn render_gpu(snapshot: &metrics::Snapshot, width: usize, height: usize) -> String {
-    let mut lines = Vec::new();
-    for (i, gpu) in snapshot
-        .gpus
-        .iter()
-        .take((height.saturating_sub(2) / 3).max(1))
-        .enumerate()
-    {
-        let pct = if gpu.memory_total_mb > 0 {
-            gpu.memory_used_mb as f64 / gpu.memory_total_mb as f64 * 100.0
-        } else {
-            0.0
-        };
-        lines.push(format!(
-            "GPU {i}: {}",
-            truncate(&gpu.name, width.saturating_sub(9))
-        ));
-        lines.push(format!(
-            "UTIL: {:>3.0}%  TEMP: {:.0}°C",
-            gpu.utilization_percent, gpu.temperature_c
-        ));
-        lines.push(format!(
-            "{} {}M/{}M",
-            bar(pct, width.saturating_sub(18)),
-            gpu.memory_used_mb,
-            gpu.memory_total_mb
-        ));
-    }
-    mag_panel("GPU", &lines.join("\n"), width, height)
-}
-
-fn render_memory(snapshot: &metrics::Snapshot, width: usize, height: usize) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "RAM  {}/{}",
-        format_bytes(snapshot.memory.used_bytes),
-        format_bytes(snapshot.memory.total_bytes)
-    ));
-    lines.push(bar(snapshot.memory.percent, width.saturating_sub(2)));
-    lines.push(format!(
-        "SWAP {}/{}",
-        format_bytes(snapshot.swap.used_bytes),
-        format_bytes(snapshot.swap.total_bytes)
-    ));
-    lines.push(bar(snapshot.swap.percent, width.saturating_sub(2)));
-    lines.push(format!(
-        "CACHE {}  BUF {}",
-        format_bytes(snapshot.memory.cached_bytes),
-        format_bytes(snapshot.memory.buffers_bytes)
-    ));
-    mag_panel("MEMORY", &lines.join("\n"), width, height)
-}
-
-fn render_network(snapshot: &metrics::Snapshot, width: usize, height: usize) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "▼ DOWN {}",
-        format_bytes_rate(snapshot.network.recv_bytes_per_sec)
-    ));
-    lines.push(sparkline(
-        network_pct(
-            snapshot.network.recv_bytes_per_sec,
-            snapshot.network.sent_bytes_per_sec,
-        ),
-        width.saturating_sub(2),
-    ));
-    lines.push(format!(
-        "▲ UP   {}",
-        format_bytes_rate(snapshot.network.sent_bytes_per_sec)
-    ));
-    lines.push(sparkline(
-        network_pct(
-            snapshot.network.sent_bytes_per_sec,
-            snapshot.network.recv_bytes_per_sec,
-        ),
-        width.saturating_sub(2),
-    ));
-    mag_panel("NETWORK", &lines.join("\n"), width, height)
-}
-
-fn render_storage(snapshot: &metrics::Snapshot, width: usize, height: usize) -> String {
-    let mut lines = Vec::new();
-    let max_disks = ((height.saturating_sub(2)) / 2).max(1);
-    for disk in snapshot.disks.iter().take(max_disks) {
-        lines.push(format!(
-            "{} {}/{} {}",
-            truncate(&disk.mountpoint, 15),
-            format_bytes(disk.used_bytes),
-            format_bytes(disk.total_bytes),
-            disk.filesystem
-        ));
-        lines.push(bar(disk.percent, width.saturating_sub(2)));
-    }
-    if lines.is_empty() {
-        lines.push("No mounted disks reported".into());
-    }
-    mag_panel("STORAGE", &lines.join("\n"), width, height)
-}
-
-fn render_inspector(
-    snapshot: &metrics::Snapshot,
-    state: &TuiState,
-    width: usize,
-    height: usize,
-) -> String {
-    let Some(proc) = selected_process(snapshot, state) else {
-        return mag_panel("INSPECTOR", "No process selected", width, height);
-    };
-    let command = if proc.command.is_empty() {
-        &proc.name
-    } else {
-        &proc.command
-    };
-    let lines = [
-        format!("PID      {}", proc.pid),
-        format!("NAME     {}", proc.name),
-        format!("USER     {}", proc.user),
-        format!("STATUS   {}", proc.status),
-        format!("CPU      {:.1}%", proc.cpu_percent),
-        format!("MEM      {:.1}%", proc.memory_percent),
-        format!("RSS      {}", format_bytes(proc.rss_bytes)),
-        String::new(),
-        "COMMAND".into(),
-        truncate(command, width.saturating_sub(2)),
-    ];
-    mag_panel("INSPECTOR", &lines.join("\n"), width, height)
-}
-
-fn render_processes(
-    snapshot: &metrics::Snapshot,
-    state: &TuiState,
-    width: usize,
-    height: usize,
-) -> String {
-    let inner = width.saturating_sub(4).max(24);
-    let mut lines = Vec::new();
-    let processes = filtered_sorted_processes(snapshot, state);
-    let sort = if state.sort_by_cpu {
-        "CPU▼"
-    } else {
-        "MEM▼"
-    };
-    let mut status_line = if state.filtering {
-        format!("/{}", state.filter)
-    } else if state.process_kill_confirm {
-        selected_process(snapshot, state).map_or_else(
-            || "  KILL?".to_string(),
-            |proc| format!("  KILL {} ({})? [Y]ES [N]O", proc.pid, proc.name),
-        )
-    } else if let Some(message) = &state.action_message {
-        format!("  {}", message.text)
-    } else {
-        format!("  SORT:{sort}  {} PROCS", processes.len())
-    };
-    if !state.filter.is_empty() && !state.filtering && !state.process_kill_confirm {
-        status_line.push_str(&format!("  FILTER:/{}", state.filter));
-    }
-    lines.push(status_line);
-    lines.push(String::new());
-    lines.push(format!(
-        " {}",
-        proc_row("PID", "COMMAND", "CPU%", "MEM%", "RSS", "USER", inner)
-    ));
-    let visible = height.saturating_sub(7).max(1);
-    let offset = visible_offset(state.process_cursor, state.process_offset, visible);
-    for proc in processes.iter().skip(offset).take(visible) {
-        let command = if proc.command.is_empty() {
-            &proc.name
-        } else {
-            &proc.command
-        };
-        lines.push(format!(
-            " {}",
-            proc_row(
-                &proc.pid.to_string(),
-                command,
-                &format!("{:.1}", proc.cpu_percent),
-                &format!("{:.1}", proc.memory_percent),
-                &format_bytes(proc.rss_bytes),
-                &proc.user,
-                inner,
-            )
-        ));
-    }
-    mag_panel("PROCESSES", &lines.join("\n"), width, height)
-}
-
-fn render_docker_text(
-    snapshot: &metrics::Snapshot,
-    state: &TuiState,
-    width: usize,
-    height: usize,
-) -> String {
-    if !state.docker_panel_visible {
-        return mag_panel(
-            "CONTAINER STATUS HIDDEN",
-            "DOCKER HIDDEN — press d to reveal read-only container status.",
-            width,
-            4,
-        );
-    }
-
-    if !snapshot.docker.available {
-        return mag_panel(
-            "DOCKER",
-            &format!(
-                "OFFLINE {}\n\nInstall Docker or start the daemon to enable status.",
-                snapshot
-                    .docker
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "docker unavailable".into())
-            ),
-            width,
-            height,
-        );
-    }
-
-    let payload = agent::build_payload(snapshot, &ops::evaluate_snapshot(snapshot), 5);
-    let mut lines = Vec::new();
-    let status_line = if let Some(confirm) = state.docker_confirm {
-        selected_container(snapshot, state).map_or_else(
-            || format!(" {}?", confirm.as_str().to_uppercase()),
-            |container| {
-                format!(
-                    " {} {}? [Y]ES [N]O",
-                    confirm.as_str().to_uppercase(),
-                    container.name
-                )
-            },
-        )
-    } else if state.docker_focused {
-        format!(
-            " ACTIVE {} CONTAINERS  {} RUNNING  {} STOPPED",
-            payload.docker.total, payload.docker.running, payload.docker.stopped
-        )
-    } else if let Some(message) = &state.action_message {
-        format!(" {}", message.text)
-    } else {
-        format!(
-            " IDLE {} CONTAINERS  {} RUNNING  {} STOPPED",
-            payload.docker.total, payload.docker.running, payload.docker.stopped
-        )
-    };
-    lines.push(status_line);
-    lines.push(String::new());
-    if snapshot.docker.containers.is_empty() {
-        lines.push("No local containers.".into());
-        return mag_panel("DOCKER", &lines.join("\n"), width, height);
-    }
-    lines.push(format!(
-        " {}",
-        docker_row("STATE", "NAME", "IMAGE", width.saturating_sub(4),)
-    ));
-    let visible = height.saturating_sub(7).max(1);
-    let offset = visible_offset(state.docker_cursor, state.docker_offset, visible);
-    for container in snapshot.docker.containers.iter().skip(offset).take(visible) {
-        let state = if container.running {
-            "RUN".to_string()
-        } else {
-            container.state.to_uppercase()
-        };
-        lines.push(format!(
-            " {}",
-            docker_row(
-                &state,
-                &container.name,
-                &container.image,
-                width.saturating_sub(4),
-            )
-        ));
-    }
-    mag_panel("DOCKER", &lines.join("\n"), width, height)
-}
-
-fn mag_panel(title: &str, content: &str, width: usize, height: usize) -> String {
-    let width = width.max(8);
-    let inner_h = height.saturating_sub(2).max(1);
-    let mut out = Vec::new();
-    out.push(section_header(title, width));
-    let mut content_lines = content.lines();
-    for _ in 0..inner_h {
-        let line = content_lines.next().unwrap_or_default();
-        let body_width = width.saturating_sub(2);
-        let line = truncate(line, body_width);
-        let pad = body_width.saturating_sub(plain_width(&line));
-        out.push(format!("▎ {}{}", line, " ".repeat(pad)));
-    }
-    out.push(thin_rule(width));
-    out.join("\n")
-}
-
-fn section_header(label: &str, width: usize) -> String {
-    let label = format!(" {} ", track(label));
-    let fill = width.saturating_sub(plain_width(&label));
-    format!("{}{}", label, "▀".repeat(fill))
-}
-
-fn help_bar(width: usize) -> String {
-    let parts = [
-        ("↑/k", "UP"),
-        ("↓/j", "DN"),
-        ("s", "SORT"),
-        ("/", "FIND"),
-        ("⏎", "INSPECT"),
-        ("K", "KILL"),
-        ("c", "DOCKER"),
-        ("x", "START/STOP"),
-        ("r", "RESTART"),
-        ("d", "DIM"),
-        ("q", "QUIT"),
-    ];
-    let bar = parts
-        .iter()
-        .map(|(key, desc)| format!(" {key}  {desc}"))
+            line
+        })
         .collect::<Vec<_>>()
-        .join("  ");
-    let pad = width.saturating_sub(plain_width(&bar)) / 2;
-    format!("{}{}", " ".repeat(pad), bar)
+        .join("\n")
 }
-
-fn join_horizontal(left: &str, right: &str, left_w: usize, _right_w: usize) -> String {
-    let left_lines: Vec<&str> = left.lines().collect();
-    let right_lines: Vec<&str> = right.lines().collect();
-    let rows = left_lines.len().max(right_lines.len());
-    let mut out = Vec::with_capacity(rows);
-    for i in 0..rows {
-        let l = *left_lines.get(i).unwrap_or(&"");
-        let r = *right_lines.get(i).unwrap_or(&"");
-        let pad = left_w.saturating_sub(plain_width(l));
-        out.push(format!("{}{}{}", l, " ".repeat(pad), r));
-    }
-    out.join("\n")
-}
-
-fn proc_row(
-    pid: &str,
-    cmd: &str,
-    cpu: &str,
-    mem: &str,
-    rss: &str,
-    user: &str,
-    max_w: usize,
-) -> String {
-    let fixed = 41usize;
-    let cmd_w = max_w.saturating_sub(fixed).max(5);
-    truncate(
-        &format!(
-            " {:<7} {:<cmd_w$} {:>6} {:>6} {:>8} {:<8}",
-            pid,
-            truncate(cmd, cmd_w),
-            cpu,
-            mem,
-            rss,
-            truncate(user, 8),
-        ),
-        max_w,
-    )
-}
-
-fn docker_row(state: &str, name: &str, image: &str, max_w: usize) -> String {
-    let fixed = 16usize;
-    let name_w = ((max_w.saturating_sub(fixed)) / 2).max(6);
-    let image_w = max_w.saturating_sub(fixed + name_w).max(6);
-    truncate(
-        &format!(
-            " {:<8} {:<name_w$} {:<image_w$}",
-            state,
-            docker_cell(name, name_w),
-            docker_cell(image, image_w)
-        ),
-        max_w,
-    )
-}
-
-fn docker_cell(text: &str, width: usize) -> String {
-    if plain_width(text) > width {
-        if width <= 3 {
-            truncate(text, width)
-        } else {
-            format!("{}...", text.chars().take(width - 3).collect::<String>())
-        }
-    } else {
-        format!("{text:<width$}")
-    }
-}
-
 fn filtered_sorted_processes<'a>(
     snapshot: &'a metrics::Snapshot,
     state: &TuiState,
@@ -923,9 +593,17 @@ fn filtered_sorted_processes<'a>(
         .collect::<Vec<_>>();
 
     if state.sort_by_cpu {
-        processes.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+        processes.sort_by(|a, b| {
+            b.cpu_percent
+                .total_cmp(&a.cpu_percent)
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
     } else {
-        processes.sort_by(|a, b| b.memory_percent.total_cmp(&a.memory_percent));
+        processes.sort_by(|a, b| {
+            b.memory_percent
+                .total_cmp(&a.memory_percent)
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
     }
 
     processes
@@ -960,49 +638,6 @@ fn visible_offset(cursor: usize, offset: usize, visible: usize) -> usize {
     }
 }
 
-fn track(text: &str) -> String {
-    text.to_uppercase()
-        .chars()
-        .map(|ch| ch.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn thin_rule(width: usize) -> String {
-    "─".repeat(width.max(1))
-}
-
-fn bar(percent: f64, width: usize) -> String {
-    if width < 6 {
-        return format!("{:>3.0}%", percent);
-    }
-    let bar_w = width.saturating_sub(5).max(1);
-    let filled = ((percent.clamp(0.0, 100.0) / 100.0) * bar_w as f64).round() as usize;
-    format!(
-        "{}{} {:>3.0}%",
-        "█".repeat(filled.min(bar_w)),
-        "░".repeat(bar_w.saturating_sub(filled)),
-        percent.clamp(0.0, 999.0)
-    )
-}
-
-fn sparkline(percent: f64, width: usize) -> String {
-    let chars = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let idx = ((percent.clamp(0.0, 100.0) / 100.0) * (chars.len() - 1) as f64).round() as usize;
-    chars[idx.min(chars.len() - 1)]
-        .to_string()
-        .repeat(width.max(1))
-}
-
-fn network_pct(value: u64, other: u64) -> f64 {
-    let max = value.max(other);
-    if max == 0 {
-        0.0
-    } else {
-        value as f64 / max as f64 * 100.0
-    }
-}
-
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -1018,515 +653,5 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn format_bytes_rate(bytes: u64) -> String {
-    format!("{}/s", format_bytes(bytes))
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if plain_width(text) <= max {
-        return text.to_string();
-    }
-    if max <= 1 {
-        return "…".into();
-    }
-    let mut out = String::new();
-    for ch in text.chars().take(max - 1) {
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
-fn plain_width(text: &str) -> usize {
-    text.chars().count()
-}
-
-fn primary(dimmed: bool) -> Color {
-    if dimmed { DIMMED_LIME } else { NEON_LIME }
-}
-
-fn secondary(dimmed: bool) -> Color {
-    if dimmed { DIMMED_PINK } else { HOT_PINK }
-}
-
-fn tertiary(dimmed: bool) -> Color {
-    if dimmed { DIMMED_CYAN } else { CYAN }
-}
-
-fn usage_color(percent: f64, dimmed: bool) -> Color {
-    if percent >= 90.0 {
-        RED
-    } else if percent >= 70.0 {
-        AMBER
-    } else if percent >= 40.0 {
-        primary(dimmed)
-    } else {
-        tertiary(dimmed)
-    }
-}
-
-fn panel_accent_from_header(line: &str, report: &ops::Report, dimmed: bool) -> Color {
-    if line.contains("L A P I S   S E N T I N E L") {
-        return match report.status {
-            ops::Status::Clear => primary(dimmed),
-            ops::Status::Watch => tertiary(dimmed),
-            ops::Status::Warn => AMBER,
-            ops::Status::Crit => RED,
-        };
-    }
-    if line.contains("N E T W O R K") || line.contains("D O C K E R") {
-        secondary(dimmed)
-    } else if line.contains("M E M O R Y") {
-        tertiary(dimmed)
-    } else if line.contains("S T O R A G E") {
-        AMBER
-    } else {
-        primary(dimmed)
-    }
-}
-
-fn styled_dashboard_text(
-    snapshot: &metrics::Snapshot,
-    report: &ops::Report,
-    state: &TuiState,
-    width: usize,
-    height: usize,
-) -> Text<'static> {
-    let plain = render_dashboard_text_size(snapshot, report, state, width, height);
-    let mut lines = Vec::new();
-    let mut accent = primary(state.dimmed);
-
-    for (row, line) in plain.lines().enumerate() {
-        if row == 0 {
-            lines.push(styled_header_line(line, state.dimmed));
-            continue;
-        }
-
-        if line.contains('▀') {
-            accent = panel_accent_from_header(line, report, state.dimmed);
-            lines.push(styled_section_header(line, accent, report, state.dimmed));
-        } else if line.chars().all(|ch| ch == '─') {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(DIM_GREY),
-            )));
-        } else if line.trim_start().starts_with('▎') {
-            lines.push(styled_body_line(line, accent, snapshot, state));
-        } else if line.contains("↑/k") && line.contains("QUIT") {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(MUTED_GREY),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(OFF_WHITE),
-            )));
-        }
-    }
-
-    Text::from(lines)
-}
-
-fn styled_header_line(line: &str, dimmed: bool) -> Line<'static> {
-    let app = " █ DURANDAL ";
-    let tagline = " SYSTEMS MONITOR";
-    if let Some(rest) = line.strip_prefix(app) {
-        let (tag, remainder) = if let Some(rest) = rest.strip_prefix(tagline) {
-            (tagline, rest)
-        } else {
-            ("", rest)
-        };
-        Line::from(vec![
-            Span::styled(
-                app.to_string(),
-                Style::default()
-                    .fg(DEEP_BLACK)
-                    .bg(primary(dimmed))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                tag.to_string(),
-                Style::default().fg(MUTED_GREY).bg(DARK_NAVY),
-            ),
-            Span::styled(
-                remainder.to_string(),
-                Style::default().fg(OFF_WHITE).bg(DARK_NAVY),
-            ),
-        ])
-    } else {
-        Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(OFF_WHITE).bg(DARK_NAVY),
-        ))
-    }
-}
-
-fn styled_section_header(
-    line: &str,
-    accent: Color,
-    report: &ops::Report,
-    dimmed: bool,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut rest = line;
-    let mut current_accent = accent;
-
-    while !rest.is_empty() {
-        if let Some((label, label_accent)) = section_label_at(rest, report, dimmed) {
-            current_accent = label_accent;
-            spans.push(Span::styled(
-                label.to_string(),
-                Style::default()
-                    .fg(DEEP_BLACK)
-                    .bg(current_accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            rest = &rest[label.len()..];
-            continue;
-        }
-
-        let next_label = next_section_label_pos(rest).unwrap_or(rest.len());
-        let (chunk, next) = rest.split_at(next_label);
-        spans.push(Span::styled(
-            chunk.to_string(),
-            Style::default().fg(current_accent),
-        ));
-        rest = next;
-    }
-
-    Line::from(spans)
-}
-
-fn section_label_at(
-    text: &str,
-    report: &ops::Report,
-    dimmed: bool,
-) -> Option<(&'static str, Color)> {
-    section_labels().iter().find_map(|(label, role)| {
-        text.starts_with(label)
-            .then(|| (*label, section_role_color(*role, report, dimmed)))
-    })
-}
-
-fn next_section_label_pos(text: &str) -> Option<usize> {
-    section_labels()
-        .iter()
-        .filter_map(|(label, _)| text.find(label))
-        .min()
-}
-
-#[derive(Clone, Copy)]
-enum SectionRole {
-    Sentinel,
-    Primary,
-    Secondary,
-    Tertiary,
-    Amber,
-}
-
-fn section_role_color(role: SectionRole, report: &ops::Report, dimmed: bool) -> Color {
-    match role {
-        SectionRole::Sentinel => match report.status {
-            ops::Status::Clear => primary(dimmed),
-            ops::Status::Watch => tertiary(dimmed),
-            ops::Status::Warn => AMBER,
-            ops::Status::Crit => RED,
-        },
-        SectionRole::Primary => primary(dimmed),
-        SectionRole::Secondary => secondary(dimmed),
-        SectionRole::Tertiary => tertiary(dimmed),
-        SectionRole::Amber => AMBER,
-    }
-}
-
-fn section_labels() -> &'static [(&'static str, SectionRole)] {
-    &[
-        (" L A P I S   S E N T I N E L ", SectionRole::Sentinel),
-        (" C P U ", SectionRole::Primary),
-        (" G P U ", SectionRole::Primary),
-        (" M E M O R Y ", SectionRole::Tertiary),
-        (" N E T W O R K ", SectionRole::Secondary),
-        (" S T O R A G E ", SectionRole::Amber),
-        (" P R O C E S S E S ", SectionRole::Primary),
-        (" D O C K E R ", SectionRole::Secondary),
-        (
-            " C O N T A I N E R   S T A T U S   H I D D E N ",
-            SectionRole::Secondary,
-        ),
-    ]
-}
-
-fn styled_body_line(
-    line: &str,
-    accent: Color,
-    snapshot: &metrics::Snapshot,
-    state: &TuiState,
-) -> Line<'static> {
-    let Some(idx) = line.find('▎') else {
-        return Line::from(Span::raw(line.to_string()));
-    };
-    let (prefix, body) = line.split_at(idx);
-    let mut spans = vec![
-        Span::styled(prefix.to_string(), Style::default().fg(OFF_WHITE)),
-        Span::styled("▎".to_string(), Style::default().fg(accent)),
-    ];
-    let rest = body.trim_start_matches('▎');
-    spans.extend(style_content(rest, snapshot, state));
-    Line::from(spans)
-}
-
-fn style_content(
-    content: &str,
-    snapshot: &metrics::Snapshot,
-    state: &TuiState,
-) -> Vec<Span<'static>> {
-    let dimmed = state.dimmed;
-    if content.contains("CPU▼") {
-        return split_keyword(content, "CPU▼", primary(dimmed));
-    }
-    if content.contains("MEM▼") {
-        return split_keyword(content, "MEM▼", secondary(dimmed));
-    }
-    if content.contains("▼ DOWN") {
-        return split_keyword(content, "▼ DOWN", primary(dimmed));
-    }
-    if content.contains("▲ UP") {
-        return split_keyword(content, "▲ UP", secondary(dimmed));
-    }
-    if content.contains("█") || content.contains("░") {
-        let color = if content.contains("RAM") || content.contains("SWAP") {
-            tertiary(dimmed)
-        } else if content.contains('/') {
-            AMBER
-        } else {
-            usage_color(snapshot.cpu.percent, dimmed)
-        };
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )];
-    }
-    if content.contains(" STATE") || content.contains(" PID") {
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default()
-                .fg(DEEP_BLACK)
-                .bg(MUTED_GREY)
-                .add_modifier(Modifier::BOLD),
-        )];
-    }
-    if selected_process_line(content, snapshot, state) {
-        let bg = if state.process_kill_confirm {
-            RED
-        } else {
-            primary(dimmed)
-        };
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default()
-                .fg(DEEP_BLACK)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD),
-        )];
-    }
-    if state.docker_focused && selected_container_line(content, snapshot, state) {
-        let bg = if state.docker_confirm.is_some() {
-            RED
-        } else {
-            primary(dimmed)
-        };
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default()
-                .fg(DEEP_BLACK)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD),
-        )];
-    }
-    if content.contains("KILL ") || content.contains("[Y]ES") || content.contains("x ") {
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default().fg(RED).add_modifier(Modifier::BOLD),
-        )];
-    }
-    if content.contains("OK ") {
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default()
-                .fg(primary(dimmed))
-                .add_modifier(Modifier::BOLD),
-        )];
-    }
-    vec![Span::styled(
-        content.to_string(),
-        Style::default().fg(OFF_WHITE),
-    )]
-}
-
-fn split_keyword(content: &str, keyword: &str, color: Color) -> Vec<Span<'static>> {
-    let Some(pos) = content.find(keyword) else {
-        return vec![Span::styled(
-            content.to_string(),
-            Style::default().fg(OFF_WHITE),
-        )];
-    };
-    let (before, after) = content.split_at(pos);
-    let after_keyword = &after[keyword.len()..];
-    vec![
-        Span::styled(before.to_string(), Style::default().fg(MUTED_GREY)),
-        Span::styled(
-            keyword.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(after_keyword.to_string(), Style::default().fg(OFF_WHITE)),
-    ]
-}
-
-fn selected_process_line(content: &str, snapshot: &metrics::Snapshot, state: &TuiState) -> bool {
-    if state.docker_focused {
-        return false;
-    }
-    let Some(proc) = selected_process(snapshot, state) else {
-        return false;
-    };
-    content.contains(&format!(" {:<7} ", proc.pid))
-}
-
-fn selected_container_line(content: &str, snapshot: &metrics::Snapshot, state: &TuiState) -> bool {
-    let Some(container) = selected_container(snapshot, state) else {
-        return false;
-    };
-    content.contains(&container.name)
-}
-
-fn draw(
-    frame: &mut ratatui::Frame<'_>,
-    snapshot: &metrics::Snapshot,
-    report: &ops::Report,
-    state: &TuiState,
-) {
-    let area = frame.area();
-    let width = usize::from(area.width).max(80);
-    let height = usize::from(area.height).max(15);
-    let text = styled_dashboard_text(snapshot, report, state, width, height);
-    let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(OFF_WHITE))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn snapshot() -> metrics::Snapshot {
-        metrics::Snapshot {
-            host: metrics::HostInfo {
-                hostname: "durandal-host".into(),
-                user: "lapis".into(),
-                uptime: "5m".into(),
-                ..Default::default()
-            },
-            cpu: metrics::CpuInfo {
-                percent: 42.0,
-                threads: 8,
-                ..Default::default()
-            },
-            memory: metrics::MemoryInfo {
-                total_bytes: 16 * 1024 * 1024 * 1024,
-                used_bytes: 7 * 1024 * 1024 * 1024,
-                percent: 44.0,
-                ..Default::default()
-            },
-            top_processes: vec![
-                metrics::ProcessInfo {
-                    pid: 100,
-                    name: "cpu-heavy".into(),
-                    cpu_percent: 80.0,
-                    memory_percent: 2.0,
-                    rss_bytes: 32 * 1024 * 1024,
-                    user: "lapis".into(),
-                    command: "cpu-heavy --serve".into(),
-                    ..Default::default()
-                },
-                metrics::ProcessInfo {
-                    pid: 200,
-                    name: "mem-heavy".into(),
-                    cpu_percent: 5.0,
-                    memory_percent: 70.0,
-                    rss_bytes: 1024 * 1024 * 1024,
-                    user: "lapis".into(),
-                    command: "mem-heavy --serve".into(),
-                    ..Default::default()
-                },
-            ],
-            docker: metrics::DockerInfo {
-                available: true,
-                containers: vec![
-                    metrics::ContainerInfo {
-                        id: "abc123".into(),
-                        image: "postgres:16".into(),
-                        name: "db".into(),
-                        state: "running".into(),
-                        running: true,
-                        ..Default::default()
-                    },
-                    metrics::ContainerInfo {
-                        id: "def456".into(),
-                        image: "redis:7".into(),
-                        name: "cache".into(),
-                        state: "exited".into(),
-                        running: false,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn process_filter_and_mem_sort_affect_rendered_rows() {
-        let snapshot = snapshot();
-        let report = ops::evaluate_snapshot(&snapshot);
-        let state = TuiState {
-            sort_by_cpu: false,
-            filter: "mem".into(),
-            ..Default::default()
-        };
-
-        let text = render_dashboard_text_size(&snapshot, &report, &state, 120, 36);
-
-        assert!(text.contains("FILTER:/mem"));
-        assert!(text.contains("mem-heavy"));
-        assert!(!text.contains("cpu-heavy"));
-        assert!(text.contains("MEM▼"));
-    }
-
-    #[test]
-    fn inspector_and_confirmations_replace_status_lines() {
-        let snapshot = snapshot();
-        let report = ops::evaluate_snapshot(&snapshot);
-        let process_state = TuiState {
-            inspector_open: true,
-            process_kill_confirm: true,
-            ..Default::default()
-        };
-
-        let text = render_dashboard_text_size(&snapshot, &report, &process_state, 120, 36);
-
-        assert!(text.contains("I N S P E C T O R"));
-        assert!(text.contains("KILL 100"));
-
-        let docker_state = TuiState {
-            docker_focused: true,
-            docker_confirm: Some(DockerConfirm::Restart),
-            ..Default::default()
-        };
-        let text = render_dashboard_text_size(&snapshot, &report, &docker_state, 120, 36);
-
-        assert!(text.contains("RESTART db? [Y]ES [N]O"));
-    }
-}
+mod tests;

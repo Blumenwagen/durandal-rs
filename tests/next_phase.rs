@@ -17,6 +17,7 @@ fn docker_snapshot() -> Snapshot {
         },
         cpu: CpuInfo {
             percent: 42.0,
+            per_core: vec![38.0, 24.0, 55.0, 12.0, 63.0, 42.0, 18.0, 35.0],
             model: "Test CPU".into(),
             cores: 4,
             threads: 8,

@@ -2,7 +2,7 @@
 name = "durandal-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Rust rewrite of Durandal, a Linux TUI system monitor and agent-readable ops snapshotter"
 license = "MIT"
 repository = "https://github.com/Blumenwagen/durandal-rs"

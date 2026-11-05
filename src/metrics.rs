@@ -1,4 +1,6 @@
 use anyhow::Context;
+mod live;
+pub use live::{LiveSample, LiveSampler};
 use std::{
     cmp::Ordering, fs, os::unix::fs::MetadataExt, path::Path, process::Command, time::Duration,
 };
@@ -29,6 +31,7 @@ pub struct HostInfo {
 #[derive(Debug, Clone, Default)]
 pub struct CpuInfo {
     pub percent: f64,
+    pub per_core: Vec<f64>,
     pub model: String,
     pub cores: usize,
     pub threads: usize,
@@ -179,12 +182,22 @@ fn parse_os_release(text: &str) -> Option<String> {
 }
 
 fn collect_cpu() -> CpuInfo {
-    let stat_a = read_cpu_stat();
+    let stat_a = read_cpu_stats();
     std::thread::sleep(Duration::from_millis(80));
-    let stat_b = read_cpu_stat();
-    let percent = match (stat_a, stat_b) {
-        (Some(a), Some(b)) => cpu_delta_percent(a, b),
+    let stat_b = read_cpu_stats();
+    let percent = match (stat_a.first(), stat_b.first()) {
+        (Some(a), Some(b)) => cpu_delta_percent(*a, *b),
         _ => 0.0,
+    };
+    let per_core = if stat_a.len() == stat_b.len() {
+        stat_a
+            .iter()
+            .zip(&stat_b)
+            .skip(1)
+            .map(|(a, b)| cpu_delta_percent(*a, *b))
+            .collect()
+    } else {
+        Vec::new()
     };
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let mut model = String::new();
@@ -209,6 +222,7 @@ fn collect_cpu() -> CpuInfo {
     }
     CpuInfo {
         percent,
+        per_core,
         model,
         cores,
         threads: processors,
@@ -220,20 +234,39 @@ struct CpuTicks {
     idle: u64,
     total: u64,
 }
-fn read_cpu_stat() -> Option<CpuTicks> {
-    let text = fs::read_to_string("/proc/stat").ok()?;
-    let line = text.lines().find(|line| line.starts_with("cpu "))?;
-    let values: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|v| v.parse().ok())
-        .collect();
-    if values.len() < 4 {
-        return None;
-    }
-    let idle = values[3] + values.get(4).copied().unwrap_or(0);
-    let total = values.iter().sum();
-    Some(CpuTicks { idle, total })
+fn read_cpu_stats() -> Vec<CpuTicks> {
+    fs::read_to_string("/proc/stat")
+        .map(|text| parse_cpu_stats(&text))
+        .unwrap_or_default()
+}
+fn parse_cpu_stats(text: &str) -> Vec<CpuTicks> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            if name != "cpu"
+                && !name.strip_prefix("cpu").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                })
+            {
+                return None;
+            }
+            let values = fields
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            if values.len() < 4 {
+                return None;
+            }
+            // Linux guest/guest_nice counters are already included in user/nice.
+            let idle = values[3].saturating_add(values.get(4).copied().unwrap_or(0));
+            let total = values
+                .iter()
+                .take(8)
+                .fold(0u64, |sum, n| sum.saturating_add(*n));
+            Some(CpuTicks { idle, total })
+        })
+        .collect()
 }
 fn cpu_delta_percent(a: CpuTicks, b: CpuTicks) -> f64 {
     let total = b.total.saturating_sub(a.total);
@@ -241,7 +274,7 @@ fn cpu_delta_percent(a: CpuTicks, b: CpuTicks) -> f64 {
     if total == 0 {
         0.0
     } else {
-        ((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+        (total.saturating_sub(idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
     }
 }
 
@@ -386,11 +419,6 @@ fn read_process(pid: i32, page_size: u64, total_ram: u64) -> Option<ProcessInfo>
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| name.clone());
-    let command = if command.len() > 40 {
-        format!("{}...", &command[..37])
-    } else {
-        command
-    };
     let user = fs::metadata(format!("/proc/{pid}"))
         .ok()
         .map(|m| m.uid().to_string())
@@ -462,5 +490,23 @@ fn percent(used: u64, total: u64) -> f64 {
         0.0
     } else {
         used as f64 / total as f64 * 100.0
+    }
+}
+
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+    #[test]
+    fn aggregate_and_per_core_counters_ignore_guest_double_counting() {
+        let before = parse_cpu_stats(
+            "cpu 10 0 10 80 0 0 0 0 5 0\ncpu0 4 0 6 40 0 0 0 0\ncpu1 6 0 4 40 0 0 0 0\nintr 7",
+        );
+        let after = parse_cpu_stats(
+            "cpu 40 0 20 140 0 0 0 0 20 0\ncpu0 24 0 6 70 0 0 0 0\ncpu1 16 0 14 70 0 0 0 0",
+        );
+        assert_eq!(before.len(), 3);
+        assert_eq!(cpu_delta_percent(before[0], after[0]), 40.0);
+        assert_eq!(cpu_delta_percent(before[1], after[1]), 40.0);
+        assert!(parse_cpu_stats("cpu nope\ncpuX 1 2 3 4").is_empty());
     }
 }
