@@ -10,13 +10,17 @@ Durandal RS is kept in its own repository so the original Go implementation can 
 
 ![Durandal RS dashboard with demo telemetry](docs/dashboard.png)
 
-The dashboard keeps Durandal's magenta, lime, and cyan identity with quieter borders,
-clear panel focus, and more space for process rows. At 100 columns and 24 rows or
-larger, resources sit beside the process and Docker tables. Smaller terminals show
+The dashboard uses Go Durandal's exact neon palette and magazine layout: reversed
+title strips, open accent rails, grey table headers, solid lime selection, and
+filled key badges. At 100 columns and 24 rows or larger, Sentinel, CPU, memory,
+network, and storage panels sit beside the process and Docker tables. Smaller terminals show
 a compact resource summary and one focused table; `Tab` switches between processes
 and containers. Below 50 × 12, the app asks for more space while keeping quit available.
 
 ![Compact dashboard at 64 columns](docs/compact.png)
+
+Compare the same demo state in [Go and Rust side by side](docs/go-parity.png).
+The reference comes from Go Durandal at `6f8e9621ca3aab548081cfac324df278565affbb`.
 
 These images render deterministic demo values through the actual Ratatui widgets;
 they are not measurements from a running Linux machine. The renderer is reproducible:
@@ -27,8 +31,8 @@ cargo run --example dashboard -- --width 64 --height 18
 cargo run --example dashboard -- --mode inspector
 ```
 
-The example also supports `docker`, `search`, `help`, `alerts`, `confirm`, and
-`offline` modes, and `--cells` exports the rendered cell colors and text as JSON.
+The example also supports `docker`, `search`, `help`, `alerts`, `confirm`,
+`offline`, and `dimmed` modes. `--cells` exports rendered text, colors, and font weights as JSON.
 
 ## Current scope
 
@@ -36,6 +40,8 @@ Linux TUI monitor, Sentinel health signals, JSON snapshots, Prometheus/OpenMetri
 output, and health-check exit codes. The Go implementation remains separate.
 
 - Collection runs on a worker so slow telemetry or Docker queries do not block navigation.
+- CPU and network graphs retain collected history (120 and 60 samples), with
+  measured per-core bars. History only advances on collection; pause freezes it.
 - Process CPU and aggregate non-loopback network rates use real interval counters
   in the TUI. The first sample is a baseline, shown as unavailable rather than zero.
   A newly observed process needs its own baseline; its CPU starts at zero.
@@ -213,7 +219,7 @@ The CI workflow runs the same formatting, lint, and test gates on GitHub.
 
 - Add configuration-file discovery and documentation once config loading is user-facing.
 - Expand parity tests against snapshots from Go Durandal.
-- Add sampled CPU history and measured GPU sensor support.
+- Add measured GPU sensor support.
 - Package release artifacts after the first repository push and CI pass.
 
 ## License

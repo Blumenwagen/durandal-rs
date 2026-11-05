@@ -17,6 +17,7 @@ fn docker_snapshot() -> Snapshot {
         },
         cpu: CpuInfo {
             percent: 42.0,
+            per_core: vec![38.0, 24.0, 55.0, 12.0, 63.0, 42.0, 18.0, 35.0],
             model: "Test CPU".into(),
             cores: 4,
             threads: 8,
@@ -140,7 +141,7 @@ fn dashboard_text_uses_go_durandal_brutalist_visual_identity() {
     assert!(text.contains("S T O R A G E"));
     assert!(text.contains("P R O C E S S E S"));
     assert!(text.contains("D O C K E R"));
-    assert!(text.contains("┌"));
+    assert!(text.contains("▎"));
     assert!(text.contains("█"));
     assert!(text.contains("░"));
     assert!(text.contains("CPU▼"));

@@ -10,6 +10,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
+    collections::VecDeque,
     io,
     process::Command,
     sync::mpsc,
@@ -48,6 +49,14 @@ pub struct TuiState {
     pub filter_before_edit: String,
     pub pending_process: Option<ProcessTarget>,
     pub pending_container: Option<ContainerTarget>,
+    pub history: VecDeque<TelemetryPoint>,
+}
+
+/// One collected sample, in basis points and bytes/s; never populated by redraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryPoint {
+    pub cpu_basis_points: u16,
+    pub network: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +124,7 @@ impl Default for TuiState {
             filter_before_edit: String::new(),
             pending_process: None,
             pending_container: None,
+            history: VecDeque::new(),
         }
     }
 }
@@ -126,6 +136,27 @@ impl TuiState {
             ..Self::default()
         }
     }
+    pub fn record_sample(&mut self, snapshot: &metrics::Snapshot) {
+        if self.paused {
+            return;
+        }
+        let cpu = if snapshot.cpu.percent.is_finite() {
+            snapshot.cpu.percent.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        self.history.push_back(TelemetryPoint {
+            cpu_basis_points: (cpu * 100.0).round() as u16,
+            network: self.network_rates_available.then_some((
+                snapshot.network.recv_bytes_per_sec,
+                snapshot.network.sent_bytes_per_sec,
+            )),
+        });
+        while self.history.len() > 120 {
+            self.history.pop_front();
+        }
+    }
+
     pub fn toggle_docker_focus(&mut self) {
         if self.docker_panel_visible {
             self.docker_focused = !self.docker_focused;
@@ -209,6 +240,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         reconcile_selection(&mut state, &snapshot, &next.snapshot);
                         state.process_cpu_available = next.process_cpu_available;
                         state.network_rates_available = next.network_rates_available;
+                        state.record_sample(&next.snapshot);
                         snapshot = next.snapshot;
                         state.last_updated = Some(next.collected_at);
                         state.refresh_error = None;

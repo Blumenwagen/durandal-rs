@@ -12,6 +12,10 @@ pub fn snapshot() -> Snapshot {
         },
         cpu: CpuInfo {
             percent: 42.0,
+            per_core: vec![
+                38.0, 24.0, 55.0, 12.0, 63.0, 42.0, 18.0, 35.0, 28.0, 34.0, 19.0, 48.0, 30.0, 72.0,
+                54.0, 42.0,
+            ],
             model: "AMD Ryzen 7 5800X".into(),
             cores: 8,
             threads: 16,
@@ -102,4 +106,27 @@ pub fn snapshot() -> Snapshot {
         },
         ..Default::default()
     }
+}
+
+/// Explicit demo data for reproducible Go/Rust visual comparison, never used by the live UI.
+pub const CPU_HISTORY: [u16; 48] = [
+    6, 9, 14, 18, 12, 8, 6, 7, 5, 9, 18, 37, 72, 95, 66, 42, 28, 16, 12, 15, 19, 25, 31, 24, 18,
+    14, 12, 20, 44, 67, 81, 55, 33, 22, 15, 11, 8, 13, 21, 30, 24, 18, 15, 22, 36, 58, 51, 42,
+];
+pub fn history() -> std::collections::VecDeque<crate::tui::TelemetryPoint> {
+    CPU_HISTORY
+        .into_iter()
+        .enumerate()
+        .map(|(i, cpu)| crate::tui::TelemetryPoint {
+            cpu_basis_points: cpu * 100,
+            network: Some(if i == 47 {
+                (245_760, 65_536)
+            } else {
+                (
+                    u64::from(cpu) * 4096,
+                    u64::from(CPU_HISTORY[(i + 13) % 48]) * 1024,
+                )
+            }),
+        })
+        .collect()
 }

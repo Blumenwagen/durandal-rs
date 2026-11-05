@@ -11,6 +11,7 @@ fn ready() -> TuiState {
         last_updated: Some(Instant::now()),
         process_cpu_available: true,
         network_rates_available: true,
+        history: support::history(),
         ..Default::default()
     }
 }
@@ -222,7 +223,7 @@ fn dashboard_handles_small_and_unicode_viewports_without_losing_quit_or_focus() 
                         width,
                         height,
                     );
-                    assert!(text.contains("q quit"), "{width}x{height}");
+                    assert!(text.contains("QUIT"), "{width}x{height}");
                     assert!(
                         text.contains("1200"),
                         "selected row clipped at {width}x{height}"
@@ -292,5 +293,67 @@ fn inspector_and_health_signals_can_scroll_through_long_details() {
             18
         )
         .contains("CRITICAL")
+    );
+}
+
+#[test]
+fn measured_history_is_bounded_and_not_extended_by_redraws_or_pause() {
+    let snapshot = support::snapshot();
+    let mut state = ready();
+    state.history.clear();
+    for _ in 0..150 {
+        state.record_sample(&snapshot);
+    }
+    assert_eq!(state.history.len(), 120);
+    assert_eq!(state.history.back().unwrap().cpu_basis_points, 4200);
+    let before = state.history.clone();
+    for _ in 0..3 {
+        render_dashboard_text(&snapshot, &ops::evaluate_snapshot(&snapshot), &state);
+    }
+    assert_eq!(state.history, before);
+    state.paused = true;
+    state.record_sample(&snapshot);
+    assert_eq!(state.history, before);
+}
+
+#[test]
+fn go_visual_contract_uses_reversed_headers_neon_accents_and_solid_selection() {
+    use ratatui::style::Color;
+    let snapshot = support::snapshot();
+    let mut state = ready();
+    let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+    terminal
+        .draw(|f| view::draw(f, &snapshot, &ops::evaluate_snapshot(&snapshot), &mut state))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let row = |text: &str| {
+        (0..36)
+            .find(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap()
+    };
+    let lime = Color::Rgb(191, 255, 0);
+    let pink = Color::Rgb(255, 0, 127);
+    let cyan = Color::Rgb(0, 240, 255);
+    let amber = Color::Rgb(255, 184, 0);
+    assert_eq!(buffer[(0, 0)].bg, lime);
+    assert_eq!(buffer[(0, row("C P U"))].bg, lime);
+    assert_eq!(buffer[(0, row("M E M O R Y"))].bg, cyan);
+    assert_eq!(buffer[(0, row("N E T W O R K"))].bg, pink);
+    assert_eq!(buffer[(0, row("S T O R A G E"))].bg, amber);
+    assert_eq!(buffer[(65, row("1200"))].bg, lime);
+    assert_eq!(buffer[(65, row("1200"))].fg, Color::Rgb(10, 10, 10));
+    assert!(!(0..36).any(|y| (0..120).any(|x| buffer[(x, y)].symbol() == "┌")));
+    state.dimmed = true;
+    terminal
+        .draw(|f| view::draw(f, &snapshot, &ops::evaluate_snapshot(&snapshot), &mut state))
+        .unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(0, 0)].bg,
+        Color::Rgb(111, 143, 0)
     );
 }

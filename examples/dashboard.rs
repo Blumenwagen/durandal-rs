@@ -2,7 +2,7 @@
 mod support;
 use clap::Parser;
 use durandal_rs::{
-    metrics, ops,
+    metrics, ops, tui,
     tui::{TuiState, draw_dashboard},
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -14,7 +14,7 @@ struct Args {
     width: u16,
     #[arg(long, default_value_t = 36)]
     height: u16,
-    #[arg(long, default_value = "overview", value_parser=["overview","docker","search","inspector","help","confirm","offline","alerts"])]
+    #[arg(long, default_value = "overview", value_parser=["overview","docker","search","inspector","help","confirm","offline","alerts","dimmed"])]
     mode: String,
     #[arg(long)]
     cells: bool,
@@ -26,10 +26,12 @@ fn main() -> anyhow::Result<()> {
         last_updated: Some(Instant::now()),
         process_cpu_available: true,
         network_rates_available: true,
+        history: support::history(),
         ..Default::default()
     };
     match args.mode.as_str() {
         "docker" => state.docker_focused = true,
+        "dimmed" => state.dimmed = true,
         "search" => {
             state.filtering = true;
             state.filter = "crabitat".into();
@@ -49,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     terminal.draw(|frame| draw_dashboard(frame, &snapshot, &report, &mut state))?;
     let buffer = terminal.backend().buffer();
     if args.cells {
-        let cells: Vec<_> = buffer.content.iter().map(|c| serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect();
+        let cells: Vec<_> = buffer.content.iter().map(|c| serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(ratatui::style::Modifier::BOLD)})).collect();
         println!(
             "{}",
             serde_json::json!({"width":args.width,"height":args.height,"cells":cells})

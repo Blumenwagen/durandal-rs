@@ -6,6 +6,15 @@ fn live_sampler_reads_linux_proc_and_primes_interval_counters() {
     let mut sampler = LiveSampler::new();
     let first = sampler.collect().expect("Linux sample");
     assert!(first.snapshot.memory.total_bytes > 0);
+    assert!(!first.snapshot.cpu.per_core.is_empty());
+    assert!(
+        first
+            .snapshot
+            .cpu
+            .per_core
+            .iter()
+            .all(|n| n.is_finite() && (0.0..=100.0).contains(n))
+    );
     assert!(!first.process_cpu_available);
     let second = sampler.collect().expect("second Linux sample");
     assert!(second.process_cpu_available);
